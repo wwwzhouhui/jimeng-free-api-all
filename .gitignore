@@ -27,3 +27,7 @@ curl(node.js)_jimeng-5.0preview-txt
 curl(node.js)_jimeng-4.6.txt
 .ipynb_checkpoints/CLAUDE-checkpoint.md
 curl(nodejs)-seedance2.0fast.txt
+.ipynb_checkpoints/test-seedance-media-checkpoint.py
+.ipynb_checkpoints/test-seedance-media-checkpoint.sh
+curl(nodejs)-seedance2.0fast+声音.txt
+curl(nodejs)-seedance2.0fast+声音2.txt

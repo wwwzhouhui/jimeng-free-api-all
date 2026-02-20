@@ -58,6 +58,84 @@ export function isSeedanceModel(model: string): boolean {
   return model.startsWith("seedance-") || model.startsWith("jimeng-video-seedance-");
 }
 
+// ========== Seedance 多类型素材支持 ==========
+
+// 素材类型
+type SeedanceMaterialType = "image" | "video" | "audio";
+
+// 上传结果统一接口
+interface UploadedMaterial {
+  type: SeedanceMaterialType;
+  // 图片
+  uri?: string;
+  // 视频/音频（VOD）
+  vid?: string;
+  // 通用
+  width?: number;
+  height?: number;
+  duration?: number;
+  fps?: number;
+  name?: string;
+}
+
+// MIME 类型 → 素材类型映射
+const MIME_TO_MATERIAL_TYPE: Record<string, SeedanceMaterialType> = {
+  "image/jpeg": "image", "image/png": "image", "image/webp": "image",
+  "image/gif": "image", "image/bmp": "image",
+  "video/mp4": "video", "video/quicktime": "video", "video/x-m4v": "video",
+  "audio/mpeg": "audio", "audio/wav": "audio", "audio/x-wav": "audio",
+  "audio/mp3": "audio",
+};
+
+// 扩展名 → 素材类型映射（兜底）
+const EXT_TO_MATERIAL_TYPE: Record<string, SeedanceMaterialType> = {
+  ".jpg": "image", ".jpeg": "image", ".png": "image", ".webp": "image",
+  ".gif": "image", ".bmp": "image",
+  ".mp4": "video", ".mov": "video", ".m4v": "video",
+  ".mp3": "audio", ".wav": "audio",
+};
+
+// materialTypes 编码映射
+const MATERIAL_TYPE_CODE: Record<SeedanceMaterialType, number> = {
+  image: 1, video: 2, audio: 3,
+};
+
+/**
+ * 检测上传文件的素材类型
+ * 优先通过 MIME 类型判断，兜底通过文件扩展名
+ */
+function detectMaterialType(file: any): SeedanceMaterialType {
+  // 优先通过 MIME 类型判断
+  const mime = (file.mimetype || file.mimeType || "").toLowerCase();
+  if (mime && MIME_TO_MATERIAL_TYPE[mime]) return MIME_TO_MATERIAL_TYPE[mime];
+  // 兜底：通过文件扩展名判断
+  const filename = (file.originalFilename || file.newFilename || "").toLowerCase();
+  const dotIdx = filename.lastIndexOf(".");
+  if (dotIdx >= 0) {
+    const ext = filename.substring(dotIdx);
+    if (EXT_TO_MATERIAL_TYPE[ext]) return EXT_TO_MATERIAL_TYPE[ext];
+  }
+  // 默认视为图片（向后兼容）
+  return "image";
+}
+
+/**
+ * 从 URL 检测素材类型
+ * 通过 URL 路径的扩展名判断
+ */
+function detectMaterialTypeFromUrl(url: string): SeedanceMaterialType {
+  try {
+    const pathname = new URL(url).pathname.toLowerCase();
+    const dotIdx = pathname.lastIndexOf(".");
+    if (dotIdx >= 0) {
+      const ext = pathname.substring(dotIdx);
+      if (EXT_TO_MATERIAL_TYPE[ext]) return EXT_TO_MATERIAL_TYPE[ext];
+    }
+  } catch {}
+  // 默认视为图片（向后兼容）
+  return "image";
+}
+
 // 视频支持的分辨率和比例配置
 const VIDEO_RESOLUTION_OPTIONS: {
   [resolution: string]: {
@@ -122,17 +200,19 @@ function createSignature(
   accessKeyId: string,
   secretAccessKey: string,
   sessionToken?: string,
-  payload: string = ''
+  payload: string = '',
+  awsRegion: string = 'cn-north-1',
+  serviceName: string = 'imagex'
 ) {
   const urlObj = new URL(url);
   const pathname = urlObj.pathname || '/';
   const search = urlObj.search;
-  
+
   // 创建规范请求
   const timestamp = headers['x-amz-date'];
   const date = timestamp.substr(0, 8);
-  const region = 'cn-north-1';
-  const service = 'imagex';
+  const region = awsRegion;
+  const service = serviceName;
   
   // 规范化查询参数
   const queryParams: Array<[string, string]> = [];
@@ -597,6 +677,249 @@ async function uploadImageBufferForVideo(buffer: Buffer, refreshToken: string): 
     logger.error(`Buffer视频图片上传失败: ${error.message}`);
     throw error;
   }
+}
+
+/**
+ * 解析音频文件时长（毫秒）
+ * 支持 WAV 格式精确解析，其他格式按 128kbps 估算
+ */
+function parseAudioDuration(buffer: Buffer): number {
+  try {
+    // WAV: RIFF header check
+    if (buffer.length >= 44 &&
+        buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+        buffer[8] === 0x57 && buffer[9] === 0x41 && buffer[10] === 0x56 && buffer[11] === 0x45) {
+      const byteRate = buffer.readUInt32LE(28);
+      if (byteRate > 0) {
+        // 查找 data chunk 获取精确大小
+        let offset = 12;
+        while (offset < buffer.length - 8) {
+          const chunkId = buffer.toString('ascii', offset, offset + 4);
+          const chunkSize = buffer.readUInt32LE(offset + 4);
+          if (chunkId === 'data') {
+            return Math.round(chunkSize / byteRate * 1000);
+          }
+          offset += 8 + chunkSize;
+        }
+        // 兜底：用文件大小估算
+        return Math.round((buffer.length - 44) / byteRate * 1000);
+      }
+    }
+    // 非 WAV：按 128kbps 估算
+    return Math.round(buffer.length / (128 * 1000 / 8) * 1000);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 上传视频/音频文件
+ * 通过 ByteDance VOD (视频点播) API 上传
+ * 流程: get_upload_token(scene=1) → ApplyUploadInner → Upload → CommitUploadInner
+ *
+ * @param buffer 文件 Buffer
+ * @param mediaType "video" 或 "audio"
+ * @param refreshToken 刷新令牌
+ * @param filename 原始文件名（可选）
+ * @returns { vid, width?, height?, duration?, fps? }
+ */
+async function uploadMediaForVideo(
+  buffer: Buffer,
+  mediaType: "video" | "audio",
+  refreshToken: string,
+  filename?: string
+): Promise<{ vid: string; width?: number; height?: number; duration?: number; fps?: number }> {
+  const label = mediaType === "audio" ? "音频" : "视频";
+  const fileSize = buffer.length;
+  logger.info(`开始上传${label}文件，大小: ${fileSize} 字节`);
+
+  // 第一步：获取 VOD 上传令牌（scene=1）
+  const tokenResult = await request("post", "/mweb/v1/get_upload_token", refreshToken, {
+    data: { scene: 1 },
+  });
+
+  const { access_key_id, secret_access_key, session_token, space_name } = tokenResult;
+  if (!access_key_id || !secret_access_key || !session_token) {
+    throw new Error(`获取${label}上传令牌失败`);
+  }
+
+  const spaceName = space_name || "dreamina";
+  logger.info(`获取${label}上传令牌成功: spaceName=${spaceName}`);
+
+  // 第二步：申请 VOD 上传权限（ApplyUploadInner）
+  const now = new Date();
+  const timestamp = now.toISOString().replace(/[:\-]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const randomStr = Math.random().toString(36).substring(2, 12);
+
+  const vodHost = "https://vod.bytedanceapi.com";
+  const applyUrl = `${vodHost}/?Action=ApplyUploadInner&Version=2020-11-19&SpaceName=${spaceName}&FileType=video&IsInner=1&FileSize=${fileSize}&s=${randomStr}`;
+
+  const requestHeaders: Record<string, string> = {
+    'x-amz-date': timestamp,
+    'x-amz-security-token': session_token,
+  };
+
+  const authorization = createSignature(
+    'GET', applyUrl, requestHeaders,
+    access_key_id, secret_access_key, session_token,
+    '', 'cn-north-1', 'vod'
+  );
+
+  logger.info(`申请${label}上传权限: ${applyUrl}`);
+
+  const applyResponse = await fetch(applyUrl, {
+    method: 'GET',
+    headers: {
+      'accept': '*/*',
+      'accept-language': 'zh-CN,zh;q=0.9',
+      'authorization': authorization,
+      'origin': 'https://jimeng.jianying.com',
+      'referer': 'https://jimeng.jianying.com/ai-tool/video/generate',
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+      'x-amz-date': timestamp,
+      'x-amz-security-token': session_token,
+    },
+  });
+
+  if (!applyResponse.ok) {
+    const errorText = await applyResponse.text();
+    throw new Error(`申请${label}上传权限失败: ${applyResponse.status} - ${errorText}`);
+  }
+
+  const applyResult: any = await applyResponse.json();
+  if (applyResult?.ResponseMetadata?.Error) {
+    throw new Error(`申请${label}上传权限失败: ${JSON.stringify(applyResult.ResponseMetadata.Error)}`);
+  }
+
+  const uploadNodes = applyResult?.Result?.InnerUploadAddress?.UploadNodes;
+  if (!uploadNodes || uploadNodes.length === 0) {
+    throw new Error(`获取${label}上传节点失败: ${JSON.stringify(applyResult)}`);
+  }
+
+  const uploadNode = uploadNodes[0];
+  const storeInfo = uploadNode.StoreInfos?.[0];
+  if (!storeInfo) {
+    throw new Error(`获取${label}上传存储信息失败: ${JSON.stringify(uploadNode)}`);
+  }
+
+  const uploadHost = uploadNode.UploadHost;
+  const storeUri = storeInfo.StoreUri;
+  const auth = storeInfo.Auth;
+  const sessionKey = uploadNode.SessionKey;
+  const vid = uploadNode.Vid;
+
+  logger.info(`获取${label}上传节点成功: host=${uploadHost}, vid=${vid}`);
+
+  // 第三步：上传文件
+  const uploadUrl = `https://${uploadHost}/upload/v1/${storeUri}`;
+  const crc32 = calculateCRC32(buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength));
+
+  logger.info(`开始上传${label}文件: ${uploadUrl}, CRC32=${crc32}`);
+
+  const uploadResponse = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Accept': '*/*',
+      'Authorization': auth,
+      'Content-CRC32': crc32,
+      'Content-Type': 'application/octet-stream',
+      'Origin': 'https://jimeng.jianying.com',
+      'Referer': 'https://jimeng.jianying.com/ai-tool/video/generate',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+    },
+    body: buffer,
+  });
+
+  if (!uploadResponse.ok) {
+    const errorText = await uploadResponse.text();
+    throw new Error(`${label}文件上传失败: ${uploadResponse.status} - ${errorText}`);
+  }
+
+  const uploadData: any = await uploadResponse.json();
+  if (uploadData?.code !== 2000) {
+    throw new Error(`${label}文件上传失败: code=${uploadData?.code}, message=${uploadData?.message}`);
+  }
+
+  logger.info(`${label}文件上传成功: crc32=${uploadData.data?.crc32}`);
+
+  // 第四步：确认上传（CommitUploadInner）
+  const commitUrl = `${vodHost}/?Action=CommitUploadInner&Version=2020-11-19&SpaceName=${spaceName}`;
+  const commitTimestamp = new Date().toISOString().replace(/[:\-]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const commitPayload = JSON.stringify({
+    SessionKey: sessionKey,
+    Functions: [],
+  });
+
+  const payloadHash = crypto.createHash('sha256').update(commitPayload, 'utf8').digest('hex');
+
+  const commitRequestHeaders: Record<string, string> = {
+    'x-amz-date': commitTimestamp,
+    'x-amz-security-token': session_token,
+    'x-amz-content-sha256': payloadHash,
+  };
+
+  const commitAuthorization = createSignature(
+    'POST', commitUrl, commitRequestHeaders,
+    access_key_id, secret_access_key, session_token,
+    commitPayload, 'cn-north-1', 'vod'
+  );
+
+  logger.info(`提交${label}上传确认: ${commitUrl}`);
+
+  const commitResponse = await fetch(commitUrl, {
+    method: 'POST',
+    headers: {
+      'accept': '*/*',
+      'authorization': commitAuthorization,
+      'content-type': 'application/json',
+      'origin': 'https://jimeng.jianying.com',
+      'referer': 'https://jimeng.jianying.com/ai-tool/video/generate',
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+      'x-amz-date': commitTimestamp,
+      'x-amz-security-token': session_token,
+      'x-amz-content-sha256': payloadHash,
+    },
+    body: commitPayload,
+  });
+
+  if (!commitResponse.ok) {
+    const errorText = await commitResponse.text();
+    throw new Error(`提交${label}上传失败: ${commitResponse.status} - ${errorText}`);
+  }
+
+  const commitResult: any = await commitResponse.json();
+  if (commitResult?.ResponseMetadata?.Error) {
+    throw new Error(`提交${label}上传失败: ${JSON.stringify(commitResult.ResponseMetadata.Error)}`);
+  }
+
+  if (!commitResult?.Result?.Results || commitResult.Result.Results.length === 0) {
+    throw new Error(`提交${label}上传响应缺少结果: ${JSON.stringify(commitResult)}`);
+  }
+
+  const result = commitResult.Result.Results[0];
+  if (!result.Vid) {
+    throw new Error(`提交${label}上传响应缺少 Vid: ${JSON.stringify(result)}`);
+  }
+
+  // 从 VOD 返回的元数据中获取信息（音频有 Duration）
+  const videoMeta = result.VideoMeta || {};
+  let duration = videoMeta.Duration ? Math.round(videoMeta.Duration * 1000) : 0;
+
+  // 如果 VOD 未返回时长，用本地解析兜底
+  if (duration <= 0 && mediaType === "audio") {
+    duration = parseAudioDuration(buffer);
+    logger.info(`VOD 未返回${label}时长，本地解析: ${duration}ms`);
+  }
+
+  logger.info(`${label}上传完成: vid=${result.Vid}, duration=${duration}ms`);
+
+  return {
+    vid: result.Vid,
+    width: videoMeta.Width || 0,
+    height: videoMeta.Height || 0,
+    duration,
+    fps: videoMeta.Fps || 0,
+  };
 }
 
 /**
@@ -1203,8 +1526,8 @@ export async function generateSeedanceVideo(
   if (totalCredit <= 0)
     await receiveCredit(refreshToken);
 
-  // 上传所有图片
-  let uploadedImages: Array<{uri: string, width: number, height: number}> = [];
+  // 上传所有文件（支持图片/视频/音频）
+  let uploadedMaterials: UploadedMaterial[] = [];
 
   // 处理上传的文件（multipart/form-data）
   if (files && files.length > 0) {
@@ -1217,77 +1540,147 @@ export async function generateSeedanceVideo(
         continue;
       }
 
+      const materialType = detectMaterialType(file);
       try {
-        logger.info(`Seedance: 开始上传第 ${i + 1} 个文件: ${file.originalFilename || file.filepath}`);
+        logger.info(`Seedance: 开始上传第 ${i + 1} 个文件 (${materialType}): ${file.originalFilename || file.filepath}`);
         const buffer = fs.readFileSync(file.filepath);
-        const imageUri = await uploadImageBufferForVideo(buffer, refreshToken);
 
-        if (imageUri) {
-          uploadedImages.push({ uri: imageUri, width, height });
-          logger.info(`Seedance: 第 ${i + 1} 个文件上传成功: ${imageUri}`);
+        if (materialType === "image") {
+          const imageUri = await uploadImageBufferForVideo(buffer, refreshToken);
+          if (imageUri) {
+            uploadedMaterials.push({ type: "image", uri: imageUri, width, height });
+            logger.info(`Seedance: 第 ${i + 1} 个图片上传成功: ${imageUri}`);
+          }
+        } else {
+          // 视频或音频 → VOD 上传
+          const vodResult = await uploadMediaForVideo(buffer, materialType, refreshToken, file.originalFilename);
+          uploadedMaterials.push({
+            type: materialType,
+            vid: vodResult.vid,
+            width: vodResult.width,
+            height: vodResult.height,
+            duration: vodResult.duration,
+            fps: vodResult.fps,
+            name: file.originalFilename || "",
+          });
+          logger.info(`Seedance: 第 ${i + 1} 个${materialType === "video" ? "视频" : "音频"}上传成功: ${vodResult.vid}`);
         }
       } catch (error) {
         logger.error(`Seedance: 第 ${i + 1} 个文件上传失败: ${error.message}`);
         if (i === 0) {
-          throw new APIException(EX.API_REQUEST_FAILED, `首张图片上传失败: ${error.message}`);
+          throw new APIException(EX.API_REQUEST_FAILED, `首个文件上传失败: ${error.message}`);
         }
       }
     }
   } else if (filePaths && filePaths.length > 0) {
-    logger.info(`Seedance: 开始上传 ${filePaths.length} 张图片`);
+    logger.info(`Seedance: 开始上传 ${filePaths.length} 个文件`);
 
     for (let i = 0; i < filePaths.length; i++) {
       const filePath = filePaths[i];
       if (!filePath) continue;
 
+      const materialType = detectMaterialTypeFromUrl(filePath);
       try {
-        logger.info(`Seedance: 开始上传第 ${i + 1} 张图片: ${filePath}`);
-        const imageUri = await uploadImageForVideo(filePath, refreshToken);
+        logger.info(`Seedance: 开始上传第 ${i + 1} 个文件 (${materialType}): ${filePath}`);
 
-        if (imageUri) {
-          uploadedImages.push({ uri: imageUri, width, height });
-          logger.info(`Seedance: 第 ${i + 1} 张图片上传成功: ${imageUri}`);
+        if (materialType === "image") {
+          const imageUri = await uploadImageForVideo(filePath, refreshToken);
+          if (imageUri) {
+            uploadedMaterials.push({ type: "image", uri: imageUri, width, height });
+            logger.info(`Seedance: 第 ${i + 1} 个图片上传成功: ${imageUri}`);
+          }
+        } else {
+          // 视频或音频 URL → 下载后 VOD 上传
+          const response = await fetch(filePath);
+          if (!response.ok) throw new Error(`下载文件失败: ${response.status}`);
+          const arrayBuffer = await response.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+          const vodResult = await uploadMediaForVideo(buffer, materialType, refreshToken);
+          uploadedMaterials.push({
+            type: materialType,
+            vid: vodResult.vid,
+            width: vodResult.width,
+            height: vodResult.height,
+            duration: vodResult.duration,
+            fps: vodResult.fps,
+          });
+          logger.info(`Seedance: 第 ${i + 1} 个${materialType === "video" ? "视频" : "音频"}上传成功: ${vodResult.vid}`);
         }
       } catch (error) {
-        logger.error(`Seedance: 第 ${i + 1} 张图片上传失败: ${error.message}`);
+        logger.error(`Seedance: 第 ${i + 1} 个文件上传失败: ${error.message}`);
         if (i === 0) {
-          throw new APIException(EX.API_REQUEST_FAILED, `首张图片上传失败: ${error.message}`);
+          throw new APIException(EX.API_REQUEST_FAILED, `首个文件上传失败: ${error.message}`);
         }
       }
     }
   }
 
-  if (uploadedImages.length === 0) {
-    throw new APIException(EX.API_REQUEST_FAILED, 'Seedance 2.0 需要至少一张图片');
+  if (uploadedMaterials.length === 0) {
+    throw new APIException(EX.API_REQUEST_FAILED, 'Seedance 2.0 需要至少一个文件（图片/视频/音频）');
   }
 
-  logger.info(`Seedance: 成功上传 ${uploadedImages.length} 张图片`);
+  logger.info(`Seedance: 成功上传 ${uploadedMaterials.length} 个文件`);
 
-  // 构建 material_list（所有图片）
-  const materialList = uploadedImages.map((img, index) => ({
-    type: "",
-    id: util.uuid(),
-    material_type: "image",
-    image_info: {
-      type: "image",
-      id: util.uuid(),
-      source_from: "upload",
-      platform_type: 1,
-      name: "",
-      image_uri: img.uri,
-      aigc_image: {
-        type: "",
-        id: util.uuid(),
-      },
-      width: img.width,
-      height: img.height,
-      format: "",
-      uri: img.uri,
+  // 动态 benefit_type：包含视频素材时追加 _with_video 后缀
+  const hasVideoMaterial = uploadedMaterials.some(m => m.type === "video");
+  const finalBenefitType = hasVideoMaterial ? `${benefitType}_with_video` : benefitType;
+
+  // 构建 material_list（支持图片/视频/音频）
+  const materialList = uploadedMaterials.map((mat) => {
+    const base = { type: "", id: util.uuid() };
+    if (mat.type === "image") {
+      return {
+        ...base,
+        material_type: "image",
+        image_info: {
+          type: "image",
+          id: util.uuid(),
+          source_from: "upload",
+          platform_type: 1,
+          name: "",
+          image_uri: mat.uri,
+          aigc_image: { type: "", id: util.uuid() },
+          width: mat.width,
+          height: mat.height,
+          format: "",
+          uri: mat.uri,
+        }
+      };
+    } else if (mat.type === "video") {
+      return {
+        ...base,
+        material_type: "video",
+        video_info: {
+          type: "video",
+          id: util.uuid(),
+          source_from: "upload",
+          name: mat.name || "",
+          vid: mat.vid,
+          fps: mat.fps || 0,
+          width: mat.width || 0,
+          height: mat.height || 0,
+          duration: mat.duration || 0,
+        }
+      };
+    } else {
+      // audio
+      return {
+        ...base,
+        material_type: "audio",
+        audio_info: {
+          type: "audio",
+          id: util.uuid(),
+          source_from: "upload",
+          vid: mat.vid,
+          duration: mat.duration || 0,
+          name: mat.name || "",
+        }
+      };
     }
-  }));
+  });
 
-  // 解析 prompt 中的图片占位符（@1, @2 等）并构建 meta_list
-  const metaList = buildMetaListFromPrompt(prompt, uploadedImages.length);
+  // 解析 prompt 中的素材占位符（@1, @2 等）并构建 meta_list
+  const metaList = buildMetaListFromPrompt(prompt, uploadedMaterials);
 
   const componentId = util.uuid();
   const submitId = util.uuid();
@@ -1316,7 +1709,7 @@ export async function generateSeedanceVideo(
         extraVipFunctionKey: model,
         useVipFunctionDetailsReporterHoc: true
       },
-      materialTypes: [1]
+      materialTypes: [...new Set(uploadedMaterials.map(m => MATERIAL_TYPE_CODE[m.type]))]
     }])
   });
 
@@ -1337,13 +1730,13 @@ export async function generateSeedanceVideo(
     extend: {
       root_model: model,
       m_video_commerce_info: {
-        benefit_type: benefitType,
+        benefit_type: finalBenefitType,
         resource_id: "generate_video",
         resource_id_type: "str",
         resource_sub_type: "aigc"
       },
       m_video_commerce_info_list: [{
-        benefit_type: benefitType,
+        benefit_type: finalBenefitType,
         resource_id: "generate_video",
         resource_id_type: "str",
         resource_sub_type: "aigc"
@@ -1538,11 +1931,13 @@ export async function generateSeedanceVideo(
 }
 
 /**
- * 解析 prompt 中的图片占位符并构建 meta_list
- * 支持格式: "使用 @1 图片，@2 图片做动画" -> [text, image(0), text, image(1), text]
+ * 解析 prompt 中的素材占位符并构建 meta_list
+ * 支持格式: "使用 @1 图片，@2 图片做动画" -> [text, material(0), text, material(1), text]
+ * meta_type 根据素材实际类型动态匹配（image/video/audio）
  */
-function buildMetaListFromPrompt(prompt: string, imageCount: number): Array<{meta_type: string, text?: string, material_ref?: {material_idx: number}}> {
+function buildMetaListFromPrompt(prompt: string, materials: Array<{ type: SeedanceMaterialType }>): Array<{meta_type: string, text?: string, material_ref?: {material_idx: number}}> {
   const metaList: Array<{meta_type: string, text?: string, material_ref?: {material_idx: number}}> = [];
+  const materialCount = materials.length;
 
   // 匹配 @1, @2, @图1, @图2, @image1 等格式
   const placeholderRegex = /@(?:图|image)?(\d+)/gi;
@@ -1559,13 +1954,13 @@ function buildMetaListFromPrompt(prompt: string, imageCount: number): Array<{met
       }
     }
 
-    // 添加图片引用
-    const imageIndex = parseInt(match[1]) - 1; // @1 对应 index 0
-    if (imageIndex >= 0 && imageIndex < imageCount) {
+    // 添加素材引用（使用对应素材的类型作为 meta_type）
+    const materialIndex = parseInt(match[1]) - 1; // @1 对应 index 0
+    if (materialIndex >= 0 && materialIndex < materialCount) {
       metaList.push({
-        meta_type: "image",
+        meta_type: materials[materialIndex].type,
         text: "",
-        material_ref: { material_idx: imageIndex }
+        material_ref: { material_idx: materialIndex }
       });
     }
 
@@ -1580,27 +1975,27 @@ function buildMetaListFromPrompt(prompt: string, imageCount: number): Array<{met
     }
   }
 
-  // 如果没有找到任何占位符，默认使用所有图片并附加整个prompt作为文本
+  // 如果没有找到任何占位符，默认引用所有素材并附加整个prompt作为文本
   if (metaList.length === 0) {
-    // 先添加所有图片引用
-    for (let i = 0; i < imageCount; i++) {
+    // 先添加所有素材引用
+    for (let i = 0; i < materialCount; i++) {
       if (i === 0) {
         metaList.push({ meta_type: "text", text: "使用" });
       }
       metaList.push({
-        meta_type: "image",
+        meta_type: materials[i].type,
         text: "",
         material_ref: { material_idx: i }
       });
-      if (i < imageCount - 1) {
+      if (i < materialCount - 1) {
         metaList.push({ meta_type: "text", text: "和" });
       }
     }
     // 添加描述文本
     if (prompt && prompt.trim()) {
-      metaList.push({ meta_type: "text", text: `图片，${prompt}` });
+      metaList.push({ meta_type: "text", text: `素材，${prompt}` });
     } else {
-      metaList.push({ meta_type: "text", text: "图片生成视频" });
+      metaList.push({ meta_type: "text", text: "素材生成视频" });
     }
   }
 

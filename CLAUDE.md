@@ -6,13 +6,13 @@
 
 即梦 AI 免费 API 服务 - 逆向工程的 API 服务器，提供 OpenAI 兼容接口，封装即梦 AI 的图像和视频生成能力。
 
-**版本：** v0.8.4
+**版本：** v0.8.5
 
 **核心功能：**
 - 文生图：支持 jimeng-5.0-preview、jimeng-4.6、jimeng-4.5 等多款模型，最高 4K 分辨率
 - 图生图：多图合成，支持 1-10 张输入图片
 - 视频生成：jimeng-video-3.5-pro 等模型，支持首帧/尾帧控制
-- Seedance 2.0：多图智能视频生成，模型名 `jimeng-video-seedance-2.0`（兼容 `seedance-2.0`），支持 @1、@2 占位符引用图片，4-15 秒时长
+- Seedance 2.0：多模态智能视频生成，模型名 `jimeng-video-seedance-2.0`（兼容 `seedance-2.0`），支持图片/视频/音频混合上传，@1、@2 占位符引用素材，4-15 秒时长
 - OpenAI 兼容：完全兼容 OpenAI API 格式，无缝对接现有客户端
 - 多账号支持：支持多个 sessionid 轮询使用
 
@@ -185,17 +185,20 @@ src/
 | resolution | string | 否 | 720p | 分辨率：480p, 720p, 1080p |
 | duration | number | 否 | 5 | 时长：4-15秒（Seedance）、5 或 10 秒（普通） |
 | file_paths / filePaths | array | 否 | [] | 首帧/尾帧图片 URL |
-| files | file[] | 否 | - | 上传的图片（multipart） |
+| files | file[] | 否 | - | 上传的素材文件（图片/视频/音频，multipart） |
 
 #### Seedance 2.0 / 2.0-fast 专用参数
 - 使用 `unified_edit_input` 结构，包含 `material_list` 和 `meta_list`
+- 支持多模态素材混合上传：图片（ImageX）、视频/音频（VOD）
+- 素材类型自动检测：通过 MIME 类型或文件扩展名判断（image/video/audio）
 - 上游标准模型名：`jimeng-video-seedance-2.0`（兼容 `seedance-2.0`、`seedance-2.0-pro`）
 - 快速版模型名：`jimeng-video-seedance-2.0-fast`（兼容 `seedance-2.0-fast`）
 - 内部模型（标准版）：`dreamina_seedance_40_pro`，benefit_type：`dreamina_video_seedance_20_pro`
 - 内部模型（快速版）：`dreamina_seedance_40`，benefit_type：`dreamina_seedance_20_fast`（注意：无 `video_` 前缀）
 - Draft 版本：3.3.9
 - 时长范围：4-15 秒（连续范围，与上游 iptag/jimeng-api 一致）
-- 提示词占位符：`@1`、`@2`、`@图1`、`@图2`、`@image1`、`@image2` 引用上传的图片
+- 提示词占位符：`@1`、`@2`、`@图1`、`@图2`、`@image1`、`@image2` 引用上传的素材
+- 支持的素材格式：图片（jpg/png/webp/gif/bmp）、视频（mp4/mov/m4v）、音频（mp3/wav）
 
 ### Shark 反爬与浏览器代理（v0.8.4）
 - 即梦对 Seedance 的 `/mweb/v1/aigc_draft/generate` 接口启用了 shark 安全中间件，要求请求携带 `a_bogus` 签名
@@ -210,6 +213,12 @@ src/
 - koa-body 配置最大文件大小 100MB
 - files 字段可以是对象或数组格式（在 Request.ts 中自动规范化）
 - 支持 formLimit/jsonLimit/textLimit：100mb
+
+### 上传通道（v0.8.5）
+- **ImageX 通道**（图片上传）：`get_upload_token(scene=2)` → `imagex.bytedanceapi.com` → `ApplyImageUpload` / `CommitImageUpload`，返回 URI 格式 `tos-cn-i-{service_id}/{uuid}`，service_id 为 `tb4s082cfz`
+- **VOD 通道**（视频/音频上传）：`get_upload_token(scene=1)` → `vod.bytedanceapi.com` → `ApplyUploadInner` / `CommitUploadInner`，返回 vid 格式 `v028xxx`，SpaceName 为 `dreamina`
+- AWS Signature V4 签名：ImageX 使用 service=`imagex`，VOD 使用 service=`vod`，region 均为 `cn-north-1`
+- VOD 上传自动返回媒体元数据（Duration、Width、Height、Fps 等），音频时长 fallback 使用本地 WAV 头解析
 
 ### 分辨率支持
 
@@ -291,6 +300,16 @@ curl -X POST http://localhost:8000/v1/videos/generations \
   -F "ratio=4:3" \
   -F "duration=5" \
   -F "files=@/path/to/image1.jpg"
+
+# Seedance 图片+音频混合视频
+curl -X POST http://localhost:8000/v1/videos/generations \
+  -H "Authorization: Bearer your_sessionid" \
+  -F "model=jimeng-video-seedance-2.0-fast" \
+  -F "prompt=@1 图片中的人物随着音乐 @2 开始跳舞" \
+  -F "ratio=9:16" \
+  -F "duration=5" \
+  -F "files=@/path/to/image.png" \
+  -F "files=@/path/to/audio.wav"
 
 # 健康检查
 curl http://localhost:8000/ping

@@ -3,7 +3,7 @@
 即梦 AI 免费 API 服务 - 支持文生图、图生图、视频生成的 OpenAI 兼容接口
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-v0.8.4-green.svg)
+![Version](https://img.shields.io/badge/version-v0.8.5-green.svg)
 ![Node](https://img.shields.io/badge/node-%3E%3D16.0.0-brightgreen.svg)
 ![Docker](https://img.shields.io/badge/docker-ready-blue.svg)
 
@@ -13,14 +13,14 @@
 
 ### 项目概述
 
-Jimeng AI Free API 是一个逆向工程的 API 服务器，将即梦 AI（Jimeng AI）的图像和视频生成能力封装为 OpenAI 兼容的 API 接口。支持最新的 **jimeng-5.0-preview**、**jimeng-4.6** 文生图模型、**Seedance 2.0 多图智能视频生成**（模型名 `jimeng-video-seedance-2.0`）及 **Seedance 2.0-fast 快速版**（模型名 `jimeng-video-seedance-2.0-fast`），零配置部署，多路 token 支持。
+Jimeng AI Free API 是一个逆向工程的 API 服务器，将即梦 AI（Jimeng AI）的图像和视频生成能力封装为 OpenAI 兼容的 API 接口。支持最新的 **jimeng-5.0-preview**、**jimeng-4.6** 文生图模型、**Seedance 2.0 多模态智能视频生成**（模型名 `jimeng-video-seedance-2.0`，支持图片/视频/音频混合上传）及 **Seedance 2.0-fast 快速版**（模型名 `jimeng-video-seedance-2.0-fast`），零配置部署，多路 token 支持。
 
 ### 核心功能
 
 - 🖼️ **文生图**：支持 jimeng-5.0-preview、jimeng-4.6、jimeng-4.5 等多款模型，最高 4K 分辨率
 - 🎭 **图生图**：多图合成，支持 1-10 张输入图片
 - 🎬 **视频生成**：jimeng-video-3.5-pro 等模型，支持首帧/尾帧控制
-- 🌊 **Seedance 2.0 / 2.0-fast**：多图智能视频生成，支持 @1、@2 占位符引用图片，fast 版本生成更快
+- 🌊 **Seedance 2.0 / 2.0-fast**：多模态智能视频生成，支持图片/视频/音频混合上传，@1、@2 占位符引用素材，fast 版本生成更快
 - 🔗 **OpenAI 兼容**：完全兼容 OpenAI API 格式，无缝对接现有客户端
 - 🔄 **多账号支持**：支持多个 sessionid 轮询使用
 
@@ -42,8 +42,9 @@ Jimeng AI Free API 是一个逆向工程的 API 服务器，将即梦 AI（Jimen
 | 图生图 | 多图合成生成新图片 | jimeng-5.0-preview, jimeng-4.6, jimeng-4.5 等 | ✅ 可用 |
 | 文生视频 | 根据文本描述生成视频 | jimeng-video-3.5-pro 等 | ✅ 可用 |
 | 图生视频 | 使用首帧/尾帧图片生成视频 | jimeng-video-3.0 等 | ✅ 可用 |
-| 多图智能视频 | Seedance 2.0 多图混合生成 | jimeng-video-seedance-2.0, seedance-2.0 | ✅ 可用 |
+| 多图智能视频 | Seedance 2.0 多模态混合生成 | jimeng-video-seedance-2.0, seedance-2.0 | ✅ 可用 |
 | 多图快速视频 | Seedance 2.0-fast 快速生成 | jimeng-video-seedance-2.0-fast, seedance-2.0-fast | ✅ 可用 |
+| 音频驱动视频 | Seedance 图片+音频混合生成 | jimeng-video-seedance-2.0, seedance-2.0-fast | ✅ 可用 |
 | Chat 接口 | OpenAI 兼容的对话接口 | 所有模型 | ✅ 可用 |
 
 ## 免责声明
@@ -227,6 +228,19 @@ curl -X POST http://localhost:8000/v1/videos/generations \
   -F "files=@/path/to/image1.jpg"
 ```
 
+**Seedance 图片+音频混合示例：**
+
+```bash
+curl -X POST http://localhost:8000/v1/videos/generations \
+  -H "Authorization: Bearer your_sessionid" \
+  -F "model=jimeng-video-seedance-2.0-fast" \
+  -F "prompt=@1 图片中的人物随着音乐 @2 开始跳舞" \
+  -F "ratio=9:16" \
+  -F "duration=5" \
+  -F "files=@/path/to/image.png" \
+  -F "files=@/path/to/audio.wav"
+```
+
 ## 项目结构
 
 ```
@@ -375,15 +389,20 @@ jimeng-free-api-all/
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | model | string | 是 | - | jimeng-video-seedance-2.0（推荐）、jimeng-video-seedance-2.0-fast（快速版）或 seedance-2.0 |
-| prompt | string | 否 | - | 提示词，使用 @1、@2 引用图片 |
+| prompt | string | 否 | - | 提示词，使用 @1、@2 引用素材（图片/视频/音频） |
 | ratio | string | 否 | 4:3 | 宽高比 |
 | duration | number | 否 | 4 | 视频时长 4-15 秒 |
-| files | file[] | 是* | - | 上传的图片（multipart） |
-| file_paths | array | 是* | - | 图片URL数组（JSON） |
+| files | file[] | 是* | - | 上传的素材文件（图片/视频/音频，multipart） |
+| file_paths | array | 是* | - | 素材URL数组（JSON） |
+
+**支持的素材类型：**
+- 图片：jpg, png, webp, gif, bmp
+- 视频：mp4, mov, m4v
+- 音频：mp3, wav
 
 **提示词占位符：**
-- `@1` / `@图1` / `@image1` - 引用第一张图片
-- `@2` / `@图2` / `@image2` - 引用第二张图片
+- `@1` / `@图1` / `@image1` - 引用第一个素材
+- `@2` / `@图2` / `@image2` - 引用第二个素材
 
 ## 效果展示
 
@@ -494,6 +513,15 @@ Authorization: Bearer sessionid1,sessionid2,sessionid3
 </details>
 
 ## 更新日志
+
+### v0.8.5 (2026-02-20) - Seedance 多模态素材支持（图片/视频/音频混合上传）
+
+- ✨ **Seedance 多模态素材上传**：支持图片、视频、音频混合上传，通过 MIME 类型和文件扩展名自动检测素材类型
+- ✨ **VOD 上传通道**：音频/视频文件通过 ByteDance VOD API 上传（`ApplyUploadInner` → Upload → `CommitUploadInner`），获取真实 VOD vid
+- ✨ **音频时长解析**：VOD 服务自动解析音频时长，兜底支持 WAV 文件头解析
+- 🔧 **AWS 签名增强**：`createSignature` 支持自定义 `region` 和 `service` 参数，支持 ImageX（`imagex`）和 VOD（`vod`）双通道签名
+- 🔧 **上传令牌分离**：图片上传使用 `scene: 2`（ImageX），音频/视频上传使用 `scene: 1`（VOD，`spaceName=dreamina`）
+- 📝 **支持的素材格式**：图片（jpg/png/webp/gif/bmp）、视频（mp4/mov/m4v）、音频（mp3/wav）
 
 ### v0.8.4 (2026-02-18) - 修复 Seedance "shark not pass" 反爬拦截
 
