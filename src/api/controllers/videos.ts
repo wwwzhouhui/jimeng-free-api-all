@@ -1615,17 +1615,19 @@ export async function generateSeedanceVideo(
     }
   }
 
-  if (uploadedMaterials.length === 0) {
-    throw new APIException(EX.API_REQUEST_FAILED, 'Seedance 2.0 需要至少一个文件（图片/视频/音频）');
+  const hasFiles = uploadedMaterials.length > 0;
+
+  if (hasFiles) {
+    logger.info(`Seedance: 成功上传 ${uploadedMaterials.length} 个文件`);
+  } else {
+    logger.info(`Seedance: 纯文本模式（无文件）`);
   }
 
-  logger.info(`Seedance: 成功上传 ${uploadedMaterials.length} 个文件`);
-
   // 动态 benefit_type：包含视频素材时追加 _with_video 后缀
-  const hasVideoMaterial = uploadedMaterials.some(m => m.type === "video");
+  const hasVideoMaterial = hasFiles && uploadedMaterials.some(m => m.type === "video");
   const finalBenefitType = hasVideoMaterial ? `${benefitType}_with_video` : benefitType;
 
-  // 构建 material_list（支持图片/视频/音频）
+  // 构建 material_list（支持图片/视频/音频）— 仅有文件时需要
   const materialList = uploadedMaterials.map((mat) => {
     const base = { type: "", id: util.uuid() };
     if (mat.type === "image") {
@@ -1679,8 +1681,8 @@ export async function generateSeedanceVideo(
     }
   });
 
-  // 解析 prompt 中的素材占位符（@1, @2 等）并构建 meta_list
-  const metaList = buildMetaListFromPrompt(prompt, uploadedMaterials);
+  // 解析 prompt 中的素材占位符（@1, @2 等）并构建 meta_list — 仅有文件时需要
+  const metaList = hasFiles ? buildMetaListFromPrompt(prompt, uploadedMaterials) : [];
 
   const componentId = util.uuid();
   const submitId = util.uuid();
@@ -1697,7 +1699,7 @@ export async function generateSeedanceVideo(
     isRegenerate: false,
     enterFrom: "click",
     position: "page_bottom_box",
-    functionMode: "omni_reference",
+    ...(hasFiles ? { functionMode: "omni_reference" } : {}),
     sceneOptions: JSON.stringify([{
       type: "video",
       scene: "BasicVideoGenerateButton",
@@ -1709,7 +1711,7 @@ export async function generateSeedanceVideo(
         extraVipFunctionKey: model,
         useVipFunctionDetailsReporterHoc: true
       },
-      materialTypes: [...new Set(uploadedMaterials.map(m => MATERIAL_TYPE_CODE[m.type]))]
+      ...(hasFiles ? { materialTypes: [...new Set(uploadedMaterials.map(m => MATERIAL_TYPE_CODE[m.type]))] } : {})
     }])
   });
 
@@ -1748,7 +1750,7 @@ export async function generateSeedanceVideo(
       type: "draft",
       id: util.uuid(),
       min_version: draftVersion,
-      min_features: ["AIGC_Video_UnifiedEdit"],
+      ...(hasFiles ? { min_features: ["AIGC_Video_UnifiedEdit"] } : {}),
       is_from_tsn: true,
       version: draftVersion,
       main_component_id: componentId,
@@ -1779,17 +1781,20 @@ export async function generateSeedanceVideo(
                 type: "",
                 id: util.uuid(),
                 min_version: draftVersion,
-                prompt: "",  // Seedance 2.0 prompt 在 meta_list 中
+                prompt: hasFiles ? "" : prompt,  // 纯文本模式直接写 prompt；有文件时 prompt 在 meta_list 中
                 video_mode: 2,
                 fps: 24,
                 duration_ms: actualDuration * 1000,
+                ...(hasFiles ? { resolution: resolution } : {}),
                 idip_meta_list: [],
-                unified_edit_input: {
-                  type: "",
-                  id: util.uuid(),
-                  material_list: materialList,
-                  meta_list: metaList
-                }
+                ...(hasFiles ? {
+                  unified_edit_input: {
+                    type: "",
+                    id: util.uuid(),
+                    material_list: materialList,
+                    meta_list: metaList
+                  }
+                } : {})
               }],
               video_aspect_ratio: aspectRatio,
               seed: Math.floor(Math.random() * 1000000000),
